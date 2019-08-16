@@ -1,0 +1,51 @@
+#!/bin/bash
+
+#echo -e "$#: $0, $1, $2\n"
+
+if [[ $# -gt 2 || $# -lt 1 ]] ; then 
+    lpower1 
+    echo -e " Valid port numbers are from 1 to 16\n"
+    echo -e "Examples:\n"
+    echo -e "\t lpower status"
+    echo -e "\t lpower on 1"
+    echo -e "\t lpower off 12"
+    exit 1
+fi 
+
+if [ "$1" == "status" ] ; then 
+	if [ $# -eq 1 ] ; then 
+		python /usr/bin/lpower1 status
+#		python /usr/bin/lpower2 status
+                echo -e "Note: Web-Power2 port#1 equals lpower port#9\n"
+		exit $?
+	else
+		if [[ $2 -ge 1 && $2 -le 8 ]] ; then 
+		    python /usr/bin/lpower1 $1 | grep "Outlet $2" 
+		    exit $?
+		else 
+		    if [[ $2 -ge 9 && $2 -le 16 ]] ; then
+			python /usr/bin/lpower2 $1 | grep "Outlet $2" 
+			exit $?
+		    fi 
+		fi 
+		echo -e "\n $0: Error1, invalid port number: $2\n"
+		exit 2
+	fi 
+fi 
+
+if [[ $2 -ge 1 && $2 -le 8 ]] ; then 
+    echo -e " lpower1 $1 $2"
+    python /usr/bin/lpower1 $1 $2
+    exit $?
+else
+	if [[ $2 -ge 9 && $2 -le 16 ]] ; then
+		lpower2_port=`expr $2 - 8` 
+		echo -e " lpower2 $1 $lpower2_port"
+		python /usr/bin/lpower2 $1 $lpower2_port
+		exit $?
+	fi
+fi 
+echo -e "\n $0: Error2, invalid port number: $2\n"
+exit 2
+
+

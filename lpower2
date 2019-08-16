@@ -1,0 +1,432 @@
+#!/usr/bin/python
+"""
+Author:  Nathan Crapo
+Date:    7/30/12
+
+The is a CLI tool for controling Network Power Switches.  It contains classes to
+save user settings, parse a command language, and manage multiple switched power
+strips.
+
+The VirtualPowerSwitch class allows programmers to create a single aggregate
+"switch" from a number of individual switches.  Their port numbers are defined
+by their order in the list of switches in the virtual device.
+"""
+import sys
+import pickle
+import os
+import re
+import dli
+import time
+import stech
+
+WEB_POWER_NAME="Web-Power2"
+APP_SETTINGS_FILE = "~/.lpower2"
+WEB_POWER_IP_ADDR="192.168.168.252"
+
+APP_VERSION="1.2"
+WEB_POWER_USER_ID="admin"
+WEB_POWER_PASSWORD="hwlab"
+
+class AppSettings:
+    """
+    Application settings allow users to associate port aliases to numbers, keep
+    track of the last used port, and set a global reset timeout value.
+    """
+    def __init__(self):
+        self.last_port = 1
+        self.port_aliases = {}
+        self.reset_timeout = 4
+
+    def add_port_alias(self, alias, port_num):
+        """ Add a alias->port number association """
+        self.port_aliases[alias] = port_num
+
+    def remove_port_alias(self, alias):
+        """ Clear a alias->port number association """
+        del(self.port_aliases[alias])
+
+    def get_port_from_alias(self, alias):
+        """ Lookup port number """
+        if not self.port_aliases.has_key(alias):
+            return -1
+        return int(self.port_aliases[alias])
+
+    def get_alias_from_port(self, port_num):
+        """ Lookup port alias """
+        for alias in self.port_aliases.keys():
+            if self.port_aliases[alias] == port_num:
+                return alias
+        return None
+
+    def get_port_aliases(self):
+        """ Get a list of port aliases """
+        return self.port_aliases.keys()
+
+    def __repr__(self):
+        return "last port: %s\nreset timeout: %d\naliases: %s" % (self.last_port, self.reset_timeout, self.port_aliases)
+
+
+
+class Command:
+    """
+    A command object defines a syntax for a user command.  The 'name' is used to
+    identify the command.  The name is used in an exact match against the input
+    tokens.  A list of exact_matches can also be specified for the input
+    processor to check.
+
+    The loose_matches list is processed with a regular expression so partial
+    matches of any length are allowed.  The programmer must ensure that partial
+    matches don't cause ambiguity for the user with overlaps in matching.
+
+    The args list defines the order of arguments that will be parsed after a
+    matching command.  By default, the arguments are required, and not optional.
+    Add the same token name to the optional_args list to make it optional.
+    Optional args must be omitted at the end of a command, or the tokenizer will
+    incorrectly associate arguments when parsing.
+    """
+    def __init__(self, name, exact_matches=None, loose_matches=None, args=None, optional_args=None, func=None):
+        self.name = name
+        self.exact_matches = exact_matches or []
+        self.loose_matches = loose_matches or []
+        self.args = args or []
+        self.optional_args = []
+        optional_args = optional_args or []
+        # Only track optional args that are in the arg list, too
+        for arg in optional_args:
+            if arg in self.args and not arg in self.optional_args:
+                self.optional_args.append(arg)
+        self.parsed_args = {}
+        self.func = func
+
+    def is_match(self, command):
+        """
+        See if the command matches the name, exact matches, or loose match
+        specification
+        """
+        if command == self.name:
+            return True
+        for loose_match in self.loose_matches:
+            if re.match(command, loose_match):
+                return True
+        for exact_match in self.exact_matches:
+            if command == exact_match:
+                return True
+        return False
+
+    def num_required_args(self):
+        num = len(self.args) - len(self.optional_args)
+        return num
+
+    def num_optional_args(self):
+        num = len(self.optional_args)
+        return num
+
+    def parse(self, input_args):
+        """
+        Associate arguments with parsed_args dictionary entries per the command
+        specification.
+        """
+        num_input_args = len(input_args)
+        if num_input_args < self.num_required_args():
+            return -1
+        arg_num = 0
+        for input_arg in input_args:
+            arg_name = self.args[arg_num]
+            self.parsed_args[arg_name] = input_arg
+            arg_num = arg_num + 1
+        return 0
+
+    def execute(self):
+        """
+        Run the function in the command def if one exists.
+        Return 0 for success, a negative value for failure.
+        """
+        if self.func:
+            return self.func(self)
+        return -1
+
+    def __repr__(self):
+        return "Name: %s\nExact Matches: %s\nLoose Matches: %s\nArguments: %s\nOptional Arguments: %s\nParsed Arguments: %s" % \
+               (self.name, self.exact_matches, self.loose_matches, self.args, self.optional_args, self.parsed_args)
+
+
+
+def _remap_port_numbers(ports, port_offset):
+    for port in ports:
+        port[0] = port[0] + port_offset
+
+class VirtualPowerSwitch:
+    """
+    Collect a bunch of individual switches into one Virtual Switch so it can be
+    controlled as one.  Dispatch operations to each unit and remap ports as
+    appropriate.
+    """
+    def __init__(self, name="", switches=None):
+        self.name = name
+        self.switches = switches or []
+
+    def verify(self):
+        """ Verify we can reach all switches, returns true if ok """
+        for dev in self.switches:
+            status = dev.geturl()
+            if not status:
+                return False
+        return True
+
+    def off(self, outlet=0):
+        """ Turn off power to an outlet """
+        if outlet == 0:
+            return -1
+        for dev in self.switches:
+            if (outlet - dev.get_num_ports()) <= 0:
+                dev.off(outlet)
+                return 0
+            else:
+                outlet = outlet - dev.get_num_ports()
+        return -1
+
+    def on(self, outlet=0):
+        """ Turn on power to an outlet """
+        for dev in self.switches:
+            if (outlet - dev.get_num_ports()) <= 0:
+                dev.on(outlet)
+                return 0
+            else:
+                outlet = outlet - dev.get_num_ports()
+        return -1
+
+    def status_list(self):
+        """
+        Return the status of all outlets in a list, each item will contain 3
+        itmes plugnumber, hostname and state
+        """
+        outlets = []
+        port_offset = 0
+        for dev in self.switches:
+            ports = dev.status_list()
+            _remap_port_numbers(ports, port_offset)
+            port_offset = port_offset + dev.get_num_ports()
+            outlets.extend(ports)
+        return outlets
+
+    def print_status(self):
+        """ Print the status off all the outlets as a table to stdout """
+        outlet_list = self.status_list()
+        if not outlet_list:
+            return None
+        print "\n%s (%s)" % (WEB_POWER_NAME, WEB_POWER_IP_ADDR) 
+        print 'Port\t%-15.15s\tState' % 'Hostname'
+        for item in outlet_list:
+            print '%d\t%-15.15s\t%s' % (item[0], item[1], item[2])
+
+    def get_num_ports(self):
+        """ Total ports for all virtual ports """
+        num_ports = 0
+        for dev in self.switches:
+            num_ports = num_ports + dev.get_num_ports()
+        return num_ports
+
+    def status(self, outlet=1):
+        """ Return the status of an outlet, returned value will be one of: On, Off, Unknown """
+        outlets = self.status_list()
+        if outlet:
+            for plug in outlets:
+                if plug[0] == outlet:
+                    return plug[2]
+        return 'Unknown'
+
+
+
+def load_settings():
+    """
+    Load settings from disk by unpickling the data and return the object.  If
+    the file cannot be loaded or is corrupt, new settings are returned instead.
+    """
+    try:
+        filename = os.path.expanduser(APP_SETTINGS_FILE)
+        settings_file = open(filename, "r")
+        settings = pickle.load(settings_file)
+        settings_file.close()
+    except:
+        settings = AppSettings()
+    return settings
+
+
+def save_settings(settings):
+    """
+    Save settings to disk by pickling the AppSettings object.
+    """
+    filename = os.path.expanduser(APP_SETTINGS_FILE)
+    settings_file = open(filename, "w")
+    pickle.dump(settings, settings_file)
+    settings_file.close()
+
+
+def usage():
+    print """
+%s - Control Lab Power Strip version %s
+lpower1 {command} [args]
+Where command is one of the following:
+  enable/on [port]     - turn port on
+  disable/off [port]   - turn port off
+  reset [port]         - power cycle the port
+  alias {port} {alias} - create an alias that can be used in place of a port number
+  clear {alias}        - clear alias -> port binding
+  status               - show the status of all ports
+  list-ports           - provide space delimited list of all port numbers and aliases
+  list-aliases         - provide space delimited list of all port aliases
+  list-settings        - print current application settings
+  help                 - this help screen
+
+Note: port numbers can be ommitted; in which case it uses the last value
+
+""" % (sys.argv[0], APP_VERSION)
+
+
+def sanity_check_port(command):
+    """
+    Get the port from the user command or use the last port.
+    """
+    if not command.parsed_args.has_key('port'):
+        port = command.settings.last_port
+    else:
+        port = command.parsed_args['port']
+        if not port == command.settings.last_port:
+            command.settings.last_port = port
+            save_settings(command.settings)
+    return port
+
+def get_port_number(settings, port):
+    """
+    Use the numeric port value, or try to convert from alias to number if
+    applicable.
+    """
+    try:
+        port_num = int(port)
+    except:
+        port_num = settings.get_port_from_alias(port)
+    return port_num
+
+def do_on(command):
+    """ Turn a port on """
+    port = sanity_check_port(command)
+    port_num = get_port_number(command.settings, port)
+    if port_num < 0:
+        sys.stderr.write("Error: invalid port alias %s\n" % port)
+        return -1
+    if port_num == 0 or port_num > command.switch.get_num_ports():
+        sys.stderr.write("Error: invalid port number %d\n" % port_num)
+        return -1
+    print "turning on", port_num
+    command.switch.on(port_num)
+
+def do_off(command):
+    """ Turn a port off """
+    port = sanity_check_port(command)
+    port_num = get_port_number(command.settings, port)
+    if port_num < 0:
+        sys.stderr.write("Error: invalid port alias %s\n" % port)
+        return -1
+    if port_num == 0 or port_num > command.switch.get_num_ports():
+        sys.stderr.write("Error: invalid port number %d\n" % port_num)
+        return -1
+    print "turning off", port_num
+    command.switch.off(port_num)
+
+def do_reset(command):
+    """ Reset a port: toggle on and then off """
+    do_off(command)
+    #time.sleep(command.settings.reset_timeout)
+    time.sleep(4)
+    do_on(command)
+
+
+def do_alias(command):
+    """ Add a port alias to the application settings """
+    alias = command.parsed_args['port_alias']
+    num = command.parsed_args['port_num']
+    command.settings.add_port_alias(alias, num)
+    save_settings(command.settings)
+
+
+def do_clear(command):
+    """ Remove a port alias from the application settings """
+    alias = command.parsed_args['port_alias']
+    command.settings.remove_port_alias(alias)
+    save_settings(command.settings)
+
+def do_status(command):
+    """ Print the status of each outlet in table format """
+    command.switch.print_status()
+
+def do_list_ports(command):
+    """ Print a space delimited list of port numbers and aliases """
+    port_list = []
+    num_ports = command.switch.get_num_ports()
+    port_list.extend([str(num) for num in range(1, num_ports + 1)])
+    port_list.extend(command.settings.get_port_aliases())
+    port_list_str = ' '.join(port_list)
+    print port_list_str
+
+def do_list_aliases(command):
+    """ Print a space delimited list of port aliases """
+    port_list = command.settings.get_port_aliases()
+    port_list_str = ' '.join(port_list)
+    print port_list_str
+
+
+def do_list_settings(command):
+    """ Show application settings """
+    print command.settings
+
+def do_help(command):
+    usage()
+
+
+
+COMMANDS = [
+    Command(name='on',     loose_matches=['enable'],  args=['port'],                   optional_args=['port'], func=do_on),
+    Command(name='off',    loose_matches=['disable'], args=['port'],                   optional_args=['port'], func=do_off),
+    Command(name='reset',  loose_matches=['reset'],   args=['port'],                   optional_args=['port'], func=do_reset),
+    Command(name='alias',  loose_matches=['alias'],   args=['port_num', 'port_alias'],                         func=do_alias),
+    Command(name='clear',  loose_matches=['clear'],   args=['port_alias'],                                     func=do_clear),
+    Command(name='status', loose_matches=['status'],                                                           func=do_status),
+    Command(name='list-ports',                                                                                 func=do_list_ports),
+    Command(name='list-aliases',                                                                               func=do_list_aliases),
+    Command(name='list-settings',                                                                              func=do_list_settings),
+    Command(name='help',                                                                                       func=do_help)
+    ]
+
+
+
+def main():
+    settings = load_settings()
+    vswitch = VirtualPowerSwitch( switches = [ dli.DliPowerSwitch(userid=WEB_POWER_USER_ID, password=WEB_POWER_PASSWORD, hostname=WEB_POWER_IP_ADDR),  ] )
+
+    if len(sys.argv) < 2:
+        usage()
+        sys.exit(-1)
+
+    for cmd in COMMANDS:
+        if not cmd.is_match(sys.argv[1]):
+            continue
+        cmd.settings = settings
+        cmd.switch = vswitch
+        error = cmd.parse(sys.argv[2:])
+        if error:
+            sys.stderr.write("Error: insufficient arguments\n")
+            usage()
+            sys.exit(-1)
+        else:
+            try:
+                error = cmd.execute()
+                sys.exit(error)
+            except Exception as e:
+                sys.stderr.write("%s\n" % str(e))
+                sys.exit(-1)
+
+    sys.stderr.write("Unknown or ambiguous command: %s\n" % sys.argv[1])
+    usage()
+
+if __name__ == "__main__":
+    main()
