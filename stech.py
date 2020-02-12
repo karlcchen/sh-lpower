@@ -16,6 +16,7 @@ The interface is based on a dli.py script written by Dwight Hubbard.
 
 import re
 import pycurl
+import bs4
 import BeautifulSoup
 import optparse
 import base64
